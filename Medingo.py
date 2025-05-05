@@ -3,17 +3,9 @@ from langdetect import detect, DetectorFactory
 import time
 import logging
 import numpy as np
-import sys
-import io
 
-# Set up proper encoding for console output
-if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
-
-# Set up logging with utf-8 encoding
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
-                    handlers=[logging.StreamHandler(sys.stdout)])
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # For reproducible language detection results
@@ -129,18 +121,6 @@ class ThaiEnglishDetector:
                 return None, None, 0
 
 def main():
-    # Print encoding information for debugging
-    print(f"Default encoding: {sys.getdefaultencoding()}")
-    print(f"File system encoding: {sys.getfilesystemencoding()}")
-    print(f"Stdout encoding: {sys.stdout.encoding}")
-    
-    # Test Thai character display
-    try:
-        print("Testing Thai character display: สวัสดี")
-    except UnicodeEncodeError:
-        print("Warning: Your console cannot display Thai characters correctly.")
-        print("Try changing your console font to a Unicode-compatible font like 'NSimSun' or 'Lucida Console'")
-    
     detector = ThaiEnglishDetector()
     
     # Allow continuous detection until user stops
@@ -153,10 +133,6 @@ def main():
                 break
     except KeyboardInterrupt:
         print("\nProgram terminated by user")
-    except UnicodeEncodeError as e:
-        print(f"Unicode encoding error: {e}")
-        print("Try running this script in a terminal with UTF-8 support.")
-        print("On Windows, you may need to use 'chcp 65001' command before running the script.")
 
 if __name__ == "__main__":
     main()
