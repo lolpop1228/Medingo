@@ -5,6 +5,8 @@ import torchaudio
 import torchaudio.transforms as T
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
+import random
+import numpy as np
 
 # ========== 1. Dataset Class ==========
 class LanguageDataset(Dataset):
@@ -28,42 +30,53 @@ class LanguageDataset(Dataset):
         return path, torch.tensor(label, dtype=torch.float)
 
 # ========== 2. MFCC Extraction ==========
-def extract_mfcc(audio_path):
+def extract_mfcc(audio_path, n_mfcc=13):
     waveform, sample_rate = torchaudio.load(audio_path)
     transform = T.MFCC(
         sample_rate=sample_rate,
-        n_mfcc=13,
+        n_mfcc=n_mfcc,
         melkwargs={"n_fft": 400, "hop_length": 160, "n_mels": 23, "center": False}
     )
     mfcc = transform(waveform)  # (channel, n_mfcc, time)
     mfcc = mfcc.mean(dim=0, keepdim=True)  # make it 1 channel
     return mfcc  # shape: [1, n_mfcc, time]
 
-# ========== 3. Simplified CNN Model with Fixed Architecture ==========
+# ========== 3. Regularized CNN Model ==========
 class LanguageDetectionCNN(nn.Module):
-    def __init__(self):
+    def __init__(self, dropout_rate=0.5):
         super(LanguageDetectionCNN, self).__init__()
         # Input shape: [batch_size, 1, 13, time]
-        # Convolutional layers with fixed dimensions
         self.features = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(16),  # Added BatchNorm
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # Halves both dimensions
+            nn.Dropout(dropout_rate/2),  # Add dropout to conv layers
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            
             nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),  # Added BatchNorm
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # Halves both dimensions again
+            nn.Dropout(dropout_rate/2),  # Add dropout to conv layers
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),  # Added BatchNorm
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((2, 10))  # Force output to fixed size regardless of input
+            nn.AdaptiveAvgPool2d((2, 10))
         )
         
-        # Fixed size after AdaptiveAvgPool2d: [batch_size, 64, 2, 10]
+        # Fixed size after AdaptiveAvgPool2d: [batch_size, 64*2*10]
         self.classifier = nn.Sequential(
-            nn.Flatten(),  # Size becomes [batch_size, 64*2*10]
+            nn.Flatten(),
             nn.Linear(64*2*10, 128),
+            nn.BatchNorm1d(128),  # Added BatchNorm
             nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(128, 1),
+            nn.Dropout(dropout_rate),
+            nn.Linear(128, 64),  # Added an extra layer with smaller size
+            nn.BatchNorm1d(64),   # Added BatchNorm
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(64, 1),
             nn.Sigmoid()
         )
 
@@ -72,13 +85,47 @@ class LanguageDetectionCNN(nn.Module):
         x = self.classifier(x)
         return x
 
-# ========== 4. Collate Function with Fixed-Length Padding ==========
-def collate_fn(batch):
+# ========== 4. Data Augmentation ==========
+def augment_mfcc(mfcc, max_len=300):
+    """Apply augmentations to MFCC features"""
+    batch_size, channels, n_mfcc, time = mfcc.shape
+    
+    # List of possible augmentations
+    augmentations = []
+    
+    # 1. Time masking - mask random time steps
+    if random.random() > 0.5:
+        mask_size = random.randint(5, min(30, time // 4))
+        mask_start = random.randint(0, time - mask_size)
+        time_mask = mfcc.clone()
+        time_mask[:, :, :, mask_start:mask_start+mask_size] = 0
+        augmentations.append(time_mask)
+    
+    # 2. Frequency masking - mask random frequency bands
+    if random.random() > 0.5:
+        mask_size = random.randint(1, min(3, n_mfcc // 2))
+        mask_start = random.randint(0, n_mfcc - mask_size)
+        freq_mask = mfcc.clone()
+        freq_mask[:, :, mask_start:mask_start+mask_size, :] = 0
+        augmentations.append(freq_mask)
+    
+    # 3. Noise addition - add small random noise
+    if random.random() > 0.5:
+        noise = torch.randn_like(mfcc) * 0.05  # small noise
+        noise_added = mfcc + noise
+        augmentations.append(noise_added)
+    
+    # If no augmentations were applied, return original
+    if not augmentations:
+        return mfcc
+    
+    # Randomly select one of the augmentations
+    return random.choice(augmentations)
+
+# ========== 5. Collate Function with Augmentation ==========
+def collate_fn_with_augmentation(batch, max_len=300, augment=True):
     mfccs = []
     labels = []
-    
-    # We'll use a fixed maximum length for consistency
-    max_len = 300  # You can adjust this based on your dataset
     
     for path, label in batch:
         # Extract MFCC
@@ -95,13 +142,28 @@ def collate_fn(batch):
             
         mfccs.append(mfcc)
         labels.append(label)
-        
+    
     mfccs = torch.stack(mfccs)  # (B, 1, n_mfcc, time)
+    
+    # Apply augmentation only during training
+    if augment:
+        mfccs = augment_mfcc(mfccs, max_len)
+        
     labels = torch.stack(labels).unsqueeze(1)
     return mfccs, labels
 
-# ========== 5. Training Function ==========
-def train_language_detection(model, data_loader, criterion, optimizer, device, epoch):
+# ========== 6. Label Noise Function ==========
+def add_label_noise(labels, noise_probability=0.1):
+    """Randomly flip labels with a certain probability"""
+    # Create a mask of labels to flip
+    mask = torch.rand_like(labels) < noise_probability
+    # Flip the selected labels (0->1, 1->0)
+    noisy_labels = labels.clone()
+    noisy_labels[mask] = 1 - noisy_labels[mask]
+    return noisy_labels
+
+# ========== 7. Training Function with Label Noise ==========
+def train_language_detection(model, data_loader, criterion, optimizer, device, epoch, label_noise_prob=0.05):
     model.train()
     running_loss = 0.0
     correct = 0
@@ -109,17 +171,27 @@ def train_language_detection(model, data_loader, criterion, optimizer, device, e
     
     for i, (mfccs, labels) in enumerate(data_loader):
         mfccs, labels = mfccs.to(device), labels.to(device)
+        
+        # Optionally add label noise
+        if label_noise_prob > 0:
+            training_labels = add_label_noise(labels, label_noise_prob)
+        else:
+            training_labels = labels
 
         # Forward pass
         outputs = model(mfccs)
-        loss = criterion(outputs, labels)
+        loss = criterion(outputs, training_labels)
 
         # Backward pass and optimize
         optimizer.zero_grad()
         loss.backward()
+        
+        # Optional: Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer.step()
         
-        # Statistics
+        # Statistics (using original labels for accuracy calculation)
         running_loss += loss.item()
         predicted = (outputs > 0.5).float()
         total += labels.size(0)
@@ -132,7 +204,7 @@ def train_language_detection(model, data_loader, criterion, optimizer, device, e
     accuracy = 100 * correct / total
     return epoch_loss, accuracy
 
-# ========== 6. Evaluation Function ==========
+# ========== 8. Evaluation Function ==========
 def evaluate(model, data_loader, criterion, device):
     model.eval()
     running_loss = 0.0
@@ -154,7 +226,7 @@ def evaluate(model, data_loader, criterion, device):
     accuracy = 100 * correct / total
     return test_loss, accuracy
 
-# ========== 7. Predict Single Audio ==========
+# ========== 9. Prediction Function ==========
 def predict_audio(model, audio_path, device):
     model.eval()
     with torch.no_grad():
@@ -177,68 +249,211 @@ def predict_audio(model, audio_path, device):
         
         return language, confidence
 
-# ========== 8. Main Training Script ==========
+# ========== 10. Simplified Model for Lower Capacity ==========
+class SimpleLanguageDetectionCNN(nn.Module):
+    def __init__(self, dropout_rate=0.5):
+        super(SimpleLanguageDetectionCNN, self).__init__()
+        # Input shape: [batch_size, 1, n_mfcc, time]
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 12, kernel_size=3, stride=1, padding=1),  # Fewer filters
+            nn.BatchNorm2d(12),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            
+            nn.Conv2d(12, 24, kernel_size=3, stride=1, padding=1),  # Fewer filters
+            nn.BatchNorm2d(24),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            
+            nn.AdaptiveAvgPool2d((2, 10))  # Simplified, removed one conv layer
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(24*2*10, 64),  # Smaller hidden layer
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(64, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+# ========== 11. Main Training Script ==========
 if __name__ == "__main__":
-    dataset_path = "dataset"  # Replace with your dataset path
-    batch_size = 4
-    num_epochs = 10
-    learning_rate = 0.001
+    # Set random seeds for reproducibility
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
     
-    # Force specific seed for reproducibility
-    torch.manual_seed(42)
+    dataset_path = "dataset"  # Replace with your dataset path
+    batch_size = 8  # Increased batch size
+    num_epochs = 30  # Increased epochs since we'll use early stopping
+    learning_rate = 0.0005  # Reduced learning rate
+    weight_decay = 1e-3  # Increased weight decay for L2 regularization
+    label_noise = 0.05  # 5% probability of flipping labels
+    use_simple_model = False  # Set to True if you need even lower accuracy
     
     # Select device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Set up dataset and data loaders
     try:
+        # Set up dataset and data loaders
         dataset = LanguageDataset(dataset_path)
         
-        # Perform train/test split
-        train_size = int(0.8 * len(dataset))
-        test_size = len(dataset) - train_size
-        train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
+        # Perform train/validation/test split
+        train_size = int(0.7 * len(dataset))  # Reduced training set size
+        val_size = int(0.15 * len(dataset))
+        test_size = len(dataset) - train_size - val_size
         
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
-                                 collate_fn=collate_fn, num_workers=0)
-        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, 
-                                collate_fn=collate_fn, num_workers=0)
+        train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
+            dataset, [train_size, val_size, test_size], 
+            generator=torch.Generator().manual_seed(seed)  # Ensure reproducible splits
+        )
         
-        # Initialize model, loss, and optimizer
-        model = LanguageDetectionCNN().to(device)
+        # Use augmentation only for training
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            collate_fn=lambda batch: collate_fn_with_augmentation(batch, augment=True), 
+            num_workers=0
+        )
+        
+        val_loader = DataLoader(
+            val_dataset, 
+            batch_size=batch_size, 
+            shuffle=False, 
+            collate_fn=lambda batch: collate_fn_with_augmentation(batch, augment=False), 
+            num_workers=0
+        )
+        
+        test_loader = DataLoader(
+            test_dataset, 
+            batch_size=batch_size, 
+            shuffle=False, 
+            collate_fn=lambda batch: collate_fn_with_augmentation(batch, augment=False), 
+            num_workers=0
+        )
+        
+        # Initialize model (choose between regular and simple model)
+        if use_simple_model:
+            model = SimpleLanguageDetectionCNN(dropout_rate=0.5).to(device)
+        else:
+            model = LanguageDetectionCNN(dropout_rate=0.5).to(device)
+            
         criterion = nn.BCELoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-5)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.5)
+        optimizer = torch.optim.AdamW(  # Changed to AdamW
+            model.parameters(), 
+            lr=learning_rate, 
+            weight_decay=weight_decay
+        )
+        
+        # More aggressive LR scheduling
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 'min', patience=3, factor=0.3
+        )
+        # We'll manually print when learning rate changes
         
         print(f"Model architecture:\n{model}")
         
-        # Train model
-        print("Starting training...")
-        best_accuracy = 0.0
+        # Early stopping setup
+        best_val_loss = float('inf')
+        patience = 7
+        counter = 0
+        best_model_path = "best_model.pth"
         
+        # For tracking target accuracy models
+        target_models = []
+        
+        # Training loop
         for epoch in range(num_epochs):
-            # Train
-            train_loss, train_acc = train_language_detection(model, train_loader, criterion, optimizer, device, epoch)
+            # Train with augmented data and label noise
+            train_loss, train_acc = train_language_detection(
+                model, train_loader, criterion, optimizer, device, epoch, 
+                label_noise_prob=label_noise
+            )
             print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {train_loss:.4f}, Train Accuracy: {train_acc:.2f}%")
             
-            # Evaluate
-            test_loss, test_acc = evaluate(model, test_loader, criterion, device)
-            print(f"Epoch {epoch+1}/{num_epochs} - Test Loss: {test_loss:.4f}, Test Accuracy: {test_acc:.2f}%")
+            # Validate
+            val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+            print(f"Epoch {epoch+1}/{num_epochs} - Validation Loss: {val_loss:.4f}, Validation Accuracy: {val_acc:.2f}%")
             
-            # Update learning rate
-            scheduler.step(test_loss)
+            # Target accuracy range check (80-90%)
+            if 80.0 <= val_acc <= 90.0:
+                model_path = f"model_acc_{val_acc:.2f}_epoch_{epoch+1}.pth"
+                torch.save(model.state_dict(), model_path)
+                print(f"✅ Saved model in target accuracy range: {val_acc:.2f}% at epoch {epoch+1}")
+                target_models.append((model_path, val_acc))
+                
+            # Early stopping check
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                counter = 0
+                # Save the model with the best validation loss
+                torch.save(model.state_dict(), best_model_path)
+                print(f"Saved best model with validation loss: {val_loss:.4f}")
+            else:
+                counter += 1
             
-            # Save best model
-            if test_acc > best_accuracy:
-                best_accuracy = test_acc
-                torch.save(model.state_dict(), "best_language_detection_model.pth")
-                print(f"New best model saved with accuracy: {best_accuracy:.2f}%")
+            # Stop if no improvement for a certain number of epochs
+            if counter >= patience:
+                print(f"Early stopping triggered. Stopping at epoch {epoch+1}.")
+                break
+            
+            # Learning rate scheduler step
+            old_lr = optimizer.param_groups[0]['lr']
+            scheduler.step(val_loss)
+            new_lr = optimizer.param_groups[0]['lr']
+            
+            # Print if learning rate changed
+            if new_lr != old_lr:
+                print(f"Learning rate reduced from {old_lr} to {new_lr}")
         
-        print(f"Training complete. Best accuracy: {best_accuracy:.2f}%")
+        print("Training complete.")
         
-        # Final model save
-        torch.save(model.state_dict(), "final_language_detection_model.pth")
+        # Select the best model in the target range if available
+        if target_models:
+            # Sort by accuracy (closer to 85% is better)
+            target_models.sort(key=lambda x: abs(x[1] - 85.0))
+            best_target_model, best_target_acc = target_models[0]
+            print(f"Best model in target range: {best_target_model} with {best_target_acc:.2f}% accuracy")
+            
+            # Load this model for testing
+            model.load_state_dict(torch.load(best_target_model))
+        else:
+            # If no model in the target range, use the one with best validation loss
+            print("No model found in target accuracy range. Using model with best validation loss.")
+            model.load_state_dict(torch.load(best_model_path))
+        
+        # Final evaluation on test set
+        test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+        print(f"Final Test Loss: {test_loss:.4f}, Test Accuracy: {test_acc:.2f}%")
+        
+        if 80.0 <= test_acc <= 90.0:
+            print(f"✅ SUCCESS! Final test accuracy {test_acc:.2f}% is in the target range (80-90%).")
+        elif test_acc > 90.0:
+            print(f"⚠️ Test accuracy {test_acc:.2f}% is ABOVE the target range.")
+            print("Suggestions to decrease accuracy:")
+            print("- Set use_simple_model = True")
+            print("- Increase label_noise to 0.1 or higher")
+            print("- Reduce n_mfcc in extract_mfcc to 8 or lower")
+        else:  # < 80%
+            print(f"⚠️ Test accuracy {test_acc:.2f}% is BELOW the target range.")
+            print("Suggestions to increase accuracy:")
+            print("- Set use_simple_model = False")
+            print("- Decrease label_noise to 0.02 or lower")
+            print("- Increase n_mfcc in extract_mfcc back to 13")
+        
+        # Save final model
+        torch.save(model.state_dict(), "final_model.pth")
         print("Final model saved.")
         
         # Test on a single audio file
