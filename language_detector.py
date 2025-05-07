@@ -1,113 +1,70 @@
-import speech_recognition as sr
-from langdetect import detect
-import logging
-import time
-import sys
-import io
+import torch
+import torch.nn as nn
+import librosa
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
 
-# Set up proper encoding for console output
-if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
-
-# Set up logging with utf-8 encoding
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
-                    handlers=[logging.StreamHandler(sys.stdout)])
-logger = logging.getLogger(__name__)
-
-class ThaiEnglishDetector:
+# Model definition (CNN)
+class AudioCNN(nn.Module):
     def __init__(self):
-        self.recognizer = sr.Recognizer()
-        self.recognizer.energy_threshold = 300
-        self.recognizer.dynamic_energy_threshold = True
-        self.recognizer.pause_threshold = 0.8
+        super(AudioCNN, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=(3, 3), stride=1, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=(3, 3), stride=1, padding=1)
+        self.fc1 = nn.Linear(64 * 32 * 32, 128)
+        self.fc2 = nn.Linear(128, 1)  # Output: binary classification
 
-        # Thai characters for detection
-        self.thai_chars = set('กขฃคฅฆงจฉชซฌญฎฏฐฑฒณดตถทธนบปผฝพฟภมยรลวศษสหฬอฮะัาำิีึืุูเแโใไ็่้๊๋์')
+    def forward(self, x):
+        x = torch.relu(self.conv1(x))
+        x = torch.relu(self.conv2(x))
+        x = x.view(x.size(0), -1)  # Flatten for fully connected layer
+        x = torch.relu(self.fc1(x))
+        x = torch.sigmoid(self.fc2(x))  # Sigmoid for binary classification
+        return x
 
-    def contains_thai_script(self, text):
-        """Check if the text contains Thai script."""
-        return any(char in self.thai_chars for char in text)
+# Function to extract MFCC features
+def extract_mfcc(audio_path, sr=16000, n_mfcc=13):
+    y, sr = librosa.load(audio_path, sr=sr)
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
+    mfcc = np.expand_dims(mfcc, axis=0)  # Add channel dimension
+    return torch.tensor(mfcc, dtype=torch.float32)
 
-    def determine_language(self, text):
-        """Determine whether the text is Thai or English."""
-        if self.contains_thai_script(text):
-            return "th", 0.95
-        
-        try:
-            detected = detect(text)
-            if detected in ["th", "en"]:
-                confidence = 0.8
-                if len(text) < 5:
-                    confidence -= 0.3
-                elif len(text) > 20:
-                    confidence += 0.1
-                return detected, min(confidence, 0.95)
-            else:
-                if all(ord(c) < 128 for c in text):
-                    return "en", 0.6
-                else:
-                    return "unknown", 0.5
-        except Exception as e:
-            logger.error(f"Error during language detection: {e}")
-            if all(ord(c) < 128 for c in text):
-                return "en", 0.5
-            else:
-                return "unknown", 0.4
-    
-    def listen_and_detect(self):
-        """Listen for speech and detect language."""
-        with sr.Microphone() as source:
-            logger.info("Adjusting for ambient noise...")
-            self.recognizer.adjust_for_ambient_noise(source, duration=1)
-            
-            logger.info("Speak something in Thai or English...")
-            try:
-                audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=10)
-                logger.info("Processing speech...")
-                
-                # Attempt to recognize speech in Thai first
-                try:
-                    text = self.recognizer.recognize_google(audio, language="th-TH")
-                    if self.contains_thai_script(text):
-                        language, confidence = "th", 0.9
-                    else:
-                        raise sr.UnknownValueError("No Thai script detected")
-                except sr.UnknownValueError:
-                    # Fallback to English
-                    text = self.recognizer.recognize_google(audio, language="en-US")
-                    language, confidence = self.determine_language(text)
-                
-                logger.info(f"Detected language: {'Thai' if language == 'th' else 'English'} (confidence: {confidence:.2f})")
-                
-                return language, confidence
-               
-            except sr.WaitTimeoutError:
-                logger.error("No speech detected within timeout period")
-                return None, 0
-            except sr.UnknownValueError:
-                logger.error("Could not understand the audio")
-                return None, 0
-            except sr.RequestError as e:
-                logger.error(f"API error: {e}")
-                return None, 0
-            except Exception as e:
-                logger.error(f"Unexpected error: {e}")
-                return None, 0
+# Dataset class
+class AudioDataset(Dataset):
+    def __init__(self, file_paths, labels):
+        self.file_paths = file_paths
+        self.labels = labels
 
+    def __len__(self):
+        return len(self.file_paths)
 
-if __name__ == "__main__":
-    detector = ThaiEnglishDetector()
-    
-    while True:
-        language, confidence = detector.listen_and_detect()
-        
-        if language:
-            print(f"Detected language: {'Thai' if language == 'th' else 'English'} (confidence: {confidence:.2f})")
-        else:
-            print("No speech detected or could not identify the language.")
-        
-        # Ask if user wants to continue listening
-        choice = input("\nContinue listening? (y/n): ")
-        if choice.lower() != 'y':
-            break
+    def __getitem__(self, idx):
+        audio_path = self.file_paths[idx]
+        label = self.labels[idx]
+        mfcc = extract_mfcc(audio_path)
+        return mfcc, label
+
+# Example training loop (simplified)
+def train(model, dataloader, epochs=10):
+    criterion = nn.BCELoss()  # Binary Cross-Entropy loss
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        for inputs, labels in dataloader:
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs.squeeze(), labels.float())
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+
+        print(f"Epoch {epoch+1}, Loss: {running_loss/len(dataloader)}")
+
+# Sample usage: Load data and train
+# file_paths = [list of paths to .wav files]
+# labels = [list of 0 or 1 indicating the language]
+# dataset = AudioDataset(file_paths, labels)
+# dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+# model = AudioCNN()
+# train(model, dataloader)
