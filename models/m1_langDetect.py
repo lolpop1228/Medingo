@@ -283,6 +283,44 @@ class SimpleLanguageDetectionCNN(nn.Module):
         x = self.classifier(x)
         return x
 
+# Add this function to your existing m1_langDetect.py file:
+
+def detect_language(audio_path):
+    """
+    Detects whether the audio is in English or Thai language.
+    
+    Args:
+        audio_path (str): Path to the audio file to analyze
+        
+    Returns:
+        str: Detected language ("english" or "thai")
+    """
+    # Check if file exists
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+    
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load the model
+    model_path = "final_model.pth"  # Try the final model first
+    if not os.path.exists(model_path):
+        model_path = "best_model.pth"  # Fall back to best model if final not found
+        
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found. Please ensure either final_model.pth or best_model.pth exists.")
+    
+    # Initialize model
+    model = LanguageDetectionCNN(dropout_rate=0.5).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    
+    # Use the existing predict_audio function
+    language, _ = predict_audio(model, audio_path, device)
+    
+    # Return lowercase language name to match the expected format
+    return language.lower()
+
 # ========== 11. Main Training Script ==========
 if __name__ == "__main__":
     # Set random seeds for reproducibility
