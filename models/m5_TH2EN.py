@@ -7,5 +7,13 @@ class THtoENTranslation:
 
     def translate(self, text):
         translated = self.model.generate(**self.tokenizer(text, return_tensors="pt", padding=True))
-        translation = self.tokenizer.decode(translated[0], skip_special_tokens=True)
-        return translation
+        return self.tokenizer.decode(translated[0], skip_special_tokens=True)
+
+# Singleton instance
+_th2en_instance = None
+
+def translate_th_to_en(text):
+    global _th2en_instance
+    if _th2en_instance is None:
+        _th2en_instance = THtoENTranslation()
+    return _th2en_instance.translate(text)

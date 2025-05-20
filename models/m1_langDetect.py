@@ -7,6 +7,8 @@ from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
 import random
 import numpy as np
+import sounddevice as sd
+from scipy.io.wavfile import write
 
 # ========== 1. Dataset Class ==========
 class LanguageDataset(Dataset):
