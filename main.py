@@ -8,7 +8,7 @@ from models.m4_EN2TH import ENtoTHTranslation
 from models.m5_TH2EN import THtoENTranslation
 
 # Load the language detection model
-def load_language_detector(model_path="final_model.pth"):
+def load_language_detector(model_path="improved_final_model.pth"):
     model = LanguageDetectionCNN()
     model.load_state_dict(torch.load(model_path, map_location=torch.device("cpu")))
     model.eval()
